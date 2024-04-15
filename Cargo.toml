@@ -1,0 +1,16 @@
+[package]
+name = "dfplayer-serial"
+version = "0.1.0"
+edition = "2021"
+description = "A simple embedded-hal driver for operating the MAX485 uart to rs485 module in half duplex mode."
+keywords = ["no-std", "driver", "embedded-hal", "mp3", "serial"]
+categories = ["embedded", "hardware-support", "no-std"]
+#repository = "https://github.com/Laboratorios-Gensokyo/dfplayer-serial"
+#documentation= "https://docs.rs/crate/dfplayer-serial/"
+license = "MIT"
+readme = "README.md"
+authors = ["José Morales <josfemova@gmail.com>"]
+
+[dependencies]
+embedded-io-async = "0.6"
+
