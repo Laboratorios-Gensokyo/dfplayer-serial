@@ -1,4 +1,5 @@
 #![no_std]
+use embassy_time::{Duration, Instant, Timer};
 use embedded_io_async::{Read, ReadReady, Write};
 
 const START_BYTE: u8 = 0x7E;
@@ -11,8 +12,8 @@ const INDEX_START_BYTE: usize = 0;
 const INDEX_VERSION: usize = 1;
 const INDEX_CMD: usize = 3;
 const INDEX_FEEDBACK_ENABLE: usize = 4;
-const INDEX_PARAM1: usize = 5;
-const INDEX_PARAM2: usize = 5;
+const INDEX_PARAM_H: usize = 5;
+const INDEX_PARAM_L: usize = 6;
 const INDEX_CHECKSUM_H: usize = 7;
 const INDEX_CHECKSUM_L: usize = 8;
 const INDEX_END_BYTE: usize = 9;
@@ -29,26 +30,27 @@ pub enum DFPlayerError<E> {
     Unknown,
     BrokenMessage,
     UserTimeout,
+    BadParameter,
 }
 
-#[derive(PartialEq)]
+#[derive(PartialEq, Debug, Clone, Copy)]
 pub struct MessageData {
     command: Command,
-    param1: u8,
-    param2: u8,
+    param_h: u8,
+    param_l: u8,
 }
 
 impl MessageData {
-    pub fn new(command: Command, param1: u8, param2: u8) -> Self {
+    pub fn new(command: Command, param_h: u8, param_l: u8) -> Self {
         Self {
             command,
-            param1,
-            param2,
+            param_h,
+            param_l,
         }
     }
 }
 
-#[derive(PartialEq)]
+#[derive(PartialEq, Debug, Clone, Copy)]
 #[repr(u8)]
 pub enum Command {
     Nothing = 0x00,
@@ -68,7 +70,7 @@ pub enum Command {
     Pause = 0x0E,
     SpecifyFolder = 0x0F,
     DACVolumeAdjustSet = 0x10,
-    RepeatPlay = 0x11,
+    LoopAll = 0x11,
     #[cfg(feature = "extended")]
     PlayMp3Folder = 0x12,
     #[cfg(feature = "extended")]
@@ -84,7 +86,7 @@ pub enum Command {
     #[cfg(feature = "extended")]
     RandomPlayback = 0x18,
     #[cfg(feature = "extended")]
-    ControlLoop = 0x19,
+    LoopCurrentTrack = 0x19,
     #[cfg(feature = "extended")]
     ControlDAC = 0x1a,
     //Queries
@@ -132,6 +134,33 @@ impl TryFrom<u8> for Command {
     }
 }
 
+#[repr(u8)]
+pub enum Equalizer {
+    Normal = 0x0,
+    Pop = 0x1,
+    Rock = 0x2,
+    Jazz = 0x3,
+    Classic = 0x4,
+    Bass = 0x5,
+}
+
+#[repr(u8)]
+pub enum PlayBackMode {
+    Repeat = 0x0,
+    FolderRepeat = 0x1,
+    SingleRepeat = 0x2,
+    Random = 0x3,
+}
+
+#[repr(u8)]
+pub enum PlayBackSource {
+    Udisk = 0x0,
+    SDCard = 0x1,
+    Aux = 0x2,
+    Sleep = 0x3,
+    Flash = 0x4,
+}
+
 pub fn checksum(buffer: &[u8]) -> u16 {
     let mut checksum = 0;
     for &b in buffer {
@@ -140,58 +169,53 @@ pub fn checksum(buffer: &[u8]) -> u16 {
     0u16.wrapping_sub(checksum)
 }
 
-pub struct DfPlayer<S>
+pub struct DfPlayer<'a, S>
 where
     S: Read + Write + ReadReady,
 {
-    port: S,
+    port: &'a mut S,
+    feedback_enable: bool,
     last_command: MessageData,
     last_response: MessageData,
-    last_cmd_acknowledge: bool,
-    /// timeout in case there are serial communication errors
-    delay_ms: fn(u64) -> (),
-    /// function that starts a timeout, waiting time depends on user
-    config_timeout: fn() -> (),
-    timeout_expired: fn() -> bool,
+    last_cmd_acknowledged: bool,
+    timeout: Duration,
 }
 
-
 /// Structure for interacting with the device
-impl<S> DfPlayer<S>
+impl<'a, S> DfPlayer<'a, S>
 where
     S: Read + Write + ReadReady,
 {
     /// Assumes port is configured 8N1 baud rate 9600, rx fifo reset on init
     pub async fn try_new(
-        port: S,
-        delay_ms: fn(u64) -> (),
-        // timeout config function. User can choose whatever they prefer, but a
-        // timeout of around 0.5s is advised
-        config_timeout: fn() -> (),
-        timeout_expired: fn() -> bool,
+        port: &'a mut S,
+        feedback_enable: bool,
+        timeout: Duration,
+        // in case you want to modify the reset delay
+        reset_duration_override: Option<Duration>,
     ) -> Result<Self, DFPlayerError<S::Error>> {
         // wait for module to turn on
-        delay_ms(3000);
+        //? Timer::after_millis(3000).await; // not needed (?
         // module sends error message after boot, it can be discarded. We also
         // ignore a possible serial/timeout error
         let mut player = Self {
             port: port,
+            feedback_enable: feedback_enable,
             last_command: MessageData::new(Command::Nothing, 0, 0),
             last_response: MessageData::new(Command::Nothing, 0, 0),
-            last_cmd_acknowledge: false,
-            delay_ms: delay_ms,
-            config_timeout: config_timeout,
-            timeout_expired: timeout_expired,
+            last_cmd_acknowledged: false,
+            timeout: timeout,
         };
-        player.read_last_message().await?;
-        player.reset().await?;
+        // discard first bytes
+        let _ = player.read_last_message().await;
+        player.reset(reset_duration_override).await?;
         Ok(player)
     }
 
     pub async fn read_last_message(
         &mut self,
     ) -> Result<(), DFPlayerError<S::Error>> {
-        (self.config_timeout)();
+        let timeout_start = Instant::now();
         // wait_ack loop
         let mut current_index = 0;
         let mut receive_buffer = [0u8; 30];
@@ -202,10 +226,10 @@ where
                 .read_ready()
                 .map_err(|e| DFPlayerError::SerialPort(e))?
             {
-                if (self.timeout_expired)() {
+                if self.timeout < Instant::now().duration_since(timeout_start) {
                     return Err(DFPlayerError::UserTimeout);
                 }
-                (self.delay_ms)(5);
+                Timer::after_millis(10).await;
             } else {
                 let cnt = self
                     .port
@@ -223,6 +247,7 @@ where
                             }
                         }
                         INDEX_END_BYTE => {
+                            esp_println::println!("{:X?}", &self.last_command);
                             if byte != END_BYTE {
                                 current_index = 0;
                             } else {
@@ -244,16 +269,16 @@ where
                                         [INDEX_CMD]
                                         .try_into()
                                         .map_err(|_| DFPlayerError::Unknown)?;
-                                    self.last_response.param1 = message
-                                        [INDEX_PARAM1]
+                                    self.last_response.param_h = message
+                                        [INDEX_PARAM_H]
                                         .try_into()
                                         .map_err(|_| DFPlayerError::Unknown)?;
-                                    self.last_response.param2 = message
-                                        [INDEX_PARAM2]
+                                    self.last_response.param_l = message
+                                        [INDEX_PARAM_L]
                                         .try_into()
                                         .map_err(|_| DFPlayerError::Unknown)?;
                                     if self.last_command == self.last_response {
-                                        self.last_cmd_acknowledge = true;
+                                        self.last_cmd_acknowledged = true;
                                     }
                                 }
 
@@ -295,36 +320,110 @@ where
             START_BYTE, VERSION, MSG_LEN, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
             END_BYTE,
         ];
+        if self.feedback_enable {
+            out_buffer[INDEX_FEEDBACK_ENABLE] = 0x1;
+        }
         out_buffer[INDEX_CMD] = command_data.command as u8;
-        out_buffer[INDEX_PARAM1] = command_data.param1;
-        out_buffer[INDEX_PARAM2] = command_data.param2;
+        out_buffer[INDEX_PARAM_H] = command_data.param_h;
+        out_buffer[INDEX_PARAM_L] = command_data.param_l;
         let checksum = checksum(&out_buffer[INDEX_VERSION..INDEX_CHECKSUM_H]);
         out_buffer[INDEX_CHECKSUM_H] = (checksum >> 8) as u8;
         out_buffer[INDEX_CHECKSUM_L] = checksum as u8;
+        esp_println::println!("{:X?}", out_buffer);
         self.port
             .write_all(&out_buffer)
             .await
             .map_err(|e| DFPlayerError::SerialPort(e))?;
+        self.last_command = command_data;
         // Orden mensajes:
         // - ACK
-        if out_buffer[INDEX_FEEDBACK_ENABLE] != 0x1 {
-            self.last_cmd_acknowledge = false;
+        if self.feedback_enable {
+            self.last_cmd_acknowledged = false;
             self.read_last_message().await?;
-            if self.last_cmd_acknowledge != true {
+            if self.last_cmd_acknowledged != true {
                 Err(DFPlayerError::FailedAck)
             } else {
                 Ok(())
             }
         } else {
-            (self.delay_ms)(out_buffer.len() as u64);
+            Timer::after_millis(out_buffer.len() as u64).await;
             Ok(())
         }
     }
-    pub async fn reset(&mut self) -> Result<(), DFPlayerError<S::Error>> {
+    pub async fn reset(
+        &mut self,
+        reset_duration_override: Option<Duration>,
+    ) -> Result<(), DFPlayerError<S::Error>> {
         self.send_command(MessageData::new(Command::Reset, 0, 0))
             .await?;
-        (self.delay_ms)(3000); // wait 3 seconds after reset
+        let wait = if let Some(duration) = reset_duration_override {
+            duration
+        } else {
+            Duration::from_millis(3000)
+        };
+        Timer::after(wait).await; // wait 3 seconds after reset
         self.read_last_message().await?;
-        todo!("Check last message to confirm state of the device");
+        //todo!("Check last message to confirm state of the device");
+        Ok(())
+    }
+
+    pub async fn playback_source(
+        &mut self,
+        playback_source: PlayBackSource,
+    ) -> Result<(), DFPlayerError<S::Error>> {
+        self.send_command(MessageData::new(
+            Command::SpecifyPlaybackSource,
+            0,
+            playback_source as u8,
+        ))
+        .await
+    }
+    pub async fn volume(
+        &mut self,
+        volume: u8,
+    ) -> Result<(), DFPlayerError<S::Error>> {
+        if volume > 30 {
+            return Err(DFPlayerError::BadParameter);
+        }
+        self.send_command(MessageData::new(Command::SpecifyVolume, 0, volume))
+            .await
+    }
+
+    pub async fn play(
+        &mut self,
+        track: u16,
+    ) -> Result<(), DFPlayerError<S::Error>> {
+        if track > 2999 {
+            return Err(DFPlayerError::BadParameter);
+        }
+        self.send_command(MessageData::new(
+            Command::SpecifyTracking,
+            (track >> 8) as u8,
+            track as u8,
+        ))
+        .await
+    }
+
+    pub async fn equalizer(
+        &mut self,
+        equalizer: Equalizer,
+    ) -> Result<(), DFPlayerError<S::Error>> {
+        self.send_command(MessageData::new(
+            Command::SpecifyEQ,
+            0,
+            equalizer as u8,
+        ))
+        .await
+    }
+    pub async fn loop_all(
+        &mut self,
+        enable: bool,
+    ) -> Result<(), DFPlayerError<S::Error>> {
+        self.send_command(MessageData::new(
+            Command::LoopAll,
+            0,
+            if enable { 1 } else { 0 },
+        ))
+        .await
     }
 }
