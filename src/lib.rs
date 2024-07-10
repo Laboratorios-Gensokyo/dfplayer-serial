@@ -1,6 +1,7 @@
 #![no_std]
 use embassy_time::{Duration, Instant, Timer};
 use embedded_io_async::{Read, ReadReady, Write};
+use defmt::*;
 
 const START_BYTE: u8 = 0x7E;
 const END_BYTE: u8 = 0xEF;
@@ -247,7 +248,7 @@ where
                             }
                         }
                         INDEX_END_BYTE => {
-                            esp_println::println!("{:X?}", &self.last_command);
+                            info!("Received message: {:?}", &message);
                             if byte != END_BYTE {
                                 current_index = 0;
                             } else {
@@ -329,7 +330,7 @@ where
         let checksum = checksum(&out_buffer[INDEX_VERSION..INDEX_CHECKSUM_H]);
         out_buffer[INDEX_CHECKSUM_H] = (checksum >> 8) as u8;
         out_buffer[INDEX_CHECKSUM_L] = checksum as u8;
-        esp_println::println!("{:X?}", out_buffer);
+        info!("Sending command: {:?}", out_buffer);
         self.port
             .write_all(&out_buffer)
             .await
