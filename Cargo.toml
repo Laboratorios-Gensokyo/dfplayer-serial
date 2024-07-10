@@ -13,5 +13,8 @@ authors = ["José Morales <josfemova@gmail.com>"]
 
 [dependencies]
 embedded-io-async = "0.6"
-embassy-time = "0.3"
-esp-println = {version = "0.9.1",features = ["esp32c3", "log"]}
+embassy-time = { git = "https://github.com/embassy-rs/embassy", features = [
+    "defmt",
+    "defmt-timestamp-uptime",
+] }
+defmt = "0.3"
