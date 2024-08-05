@@ -439,11 +439,9 @@ where
         
         if self.feedback_enable && (command_data.command != Command::Reset) {
             if self.last_cmd_acknowledged != true {
-                esp_println::println!(
-                    "wut {:02X?} {:02X?}",
+                info!("wut {:?} {:?}",
                     self.last_command,
-                    self.last_response
-                );
+                    self.last_response);
                 Err(Error::FailedAck)
             } else {
                 Ok(())
