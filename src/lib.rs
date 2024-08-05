@@ -440,8 +440,8 @@ where
         if self.feedback_enable && (command_data.command != Command::Reset) {
             if self.last_cmd_acknowledged != true {
                 info!("wut {:?} {:?}",
-                    self.last_command,
-                    self.last_response);
+                    Debug2Format(&self.last_command),
+                    Debug2Format(&self.last_response));
                 Err(Error::FailedAck)
             } else {
                 Ok(())
